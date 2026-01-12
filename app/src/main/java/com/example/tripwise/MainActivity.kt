@@ -33,7 +33,7 @@ class MainActivity : ComponentActivity() {
                 // Pass a callback so the composable can trigger navigation cleanly
                 SplashScreen(
                     onFinished = {
-                        startActivity(Intent(this, HomeActivity::class.java))
+                        startActivity(Intent(this, LoginActivity::class.java))
                         finish() // prevent coming back to splash on back press
                     }
                 )

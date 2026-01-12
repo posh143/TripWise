@@ -1,5 +1,6 @@
 package com.example.tripwise
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -9,21 +10,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.material.icons.filled.FilterList
-import androidx.compose.material.icons.filled.LocationOn
-import androidx.compose.material.icons.filled.Map
-import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Person
-import androidx.compose.material.icons.filled.Place
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,92 +24,153 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.tripwise.ui.theme.TripWiseTheme
-import kotlinx.coroutines.launch
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.DocumentReference
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
+import kotlinx.coroutines.tasks.await
+import kotlin.math.roundToInt
 
 class HomeActivity : ComponentActivity() {
+
+    private val auth by lazy { FirebaseAuth.getInstance() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
         setContent {
             TripWiseTheme {
-                HomeScreen()
+                HomeScreen(
+                    onLogout = {
+                        auth.signOut()
+                        startActivity(Intent(this, LoginActivity::class.java))
+                        finish()
+                    },
+                    onOpenDetails = { userId, placeId ->
+                        val i = Intent(this, PlaceDetailsActivity::class.java).apply {
+                            putExtra("userId", userId)
+                            putExtra("placeId", placeId)
+                        }
+                        startActivity(i)
+                    }
+                )
             }
         }
     }
 }
 
-/* ---------- Data Models & Sample Data ---------- */
-
-enum class Category { Attractions, Restaurants, Hotels }
+/* ---------- Data Model ---------- */
 
 data class Place(
-    val id: String,
-    val name: String,
-    val category: Category,
-    val distanceMeters: Int,
-    val rating: Double,
-    val address: String,
+    val id: String = "",
+    val name: String = "",
+    val category: String = "", // "Attractions" | "Restaurants" | "Hotels"
+    val distanceMeters: Int = 0,
+    val rating: Double = 0.0,
+    val address: String = "",
     val isFavorite: Boolean = false
 )
 
 private fun samplePlaces(): List<Place> = listOf(
-    Place("1", "Riverside Museum", Category.Attractions, 450, 4.6, "12 River St, City"),
-    Place("2", "Skyline Viewpoint", Category.Attractions, 900, 4.8, "Hilltop Rd, City"),
-    Place("3", "Blue Harbor Hotel", Category.Hotels, 1200, 4.3, "45 Ocean Ave, City"),
-    Place("4", "Bella Italia", Category.Restaurants, 300, 4.5, "22 Market Ln, City"),
-    Place("5", "City Art Gallery", Category.Attractions, 1500, 4.7, "Museum Sq, City"),
-    Place("6", "Maple Inn", Category.Hotels, 850, 4.1, "78 Park Rd, City"),
+    Place("1", "Riverside Museum", "Attractions", 450, 4.6, "12 River St, City", false),
+    Place("2", "Skyline Viewpoint", "Attractions", 900, 4.8, "Hilltop Rd, City", false),
+    Place("3", "Blue Harbor Hotel", "Hotels", 1200, 4.3, "45 Ocean Ave, City", false),
+    Place("4", "Bella Italia", "Restaurants", 300, 4.5, "22 Market Ln, City", false),
+    Place("5", "City Art Gallery", "Attractions", 1500, 4.7, "Museum Sq, City", false),
+    Place("6", "Maple Inn", "Hotels", 850, 4.1, "78 Park Rd, City", false),
 )
 
-/* ---------- UI ---------- */
+/* ---------- HOME SCREEN ---------- */
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen() {
-    val scope = rememberCoroutineScope()
-    var query by remember { mutableStateOf("") }
-    var selectedCategory by remember { mutableStateOf<Category?>(null) }
-    var favorites by remember { mutableStateOf(setOf<String>()) }
-    var places by remember { mutableStateOf(samplePlaces()) }
+fun HomeScreen(
+    onLogout: () -> Unit,
+    onOpenDetails: (userId: String, placeId: String) -> Unit
+) {
+    val db = remember { FirebaseFirestore.getInstance() }
+    val auth = remember { FirebaseAuth.getInstance() }
+    val userId = auth.currentUser?.uid ?: "guest"
 
-    // Derived filtered list
-    val filtered = remember(query, selectedCategory, favorites, places) {
-        places
-            .filter { p ->
-                (selectedCategory == null || p.category == selectedCategory) &&
-                        (query.isBlank() || p.name.contains(query, ignoreCase = true))
+    var query by remember { mutableStateOf("") }
+    var selectedCategory by remember { mutableStateOf<String?>(null) }
+
+    var places by remember { mutableStateOf<List<Place>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var showAddDialog by remember { mutableStateOf(false) }
+
+    val seedDoc = remember { db.collection("users").document(userId).collection("meta").document("seed") }
+    val placesCol = remember { db.collection("users").document(userId).collection("places") }
+
+    // ✅ Seed once + real-time listener
+    LaunchedEffect(userId) {
+        try {
+            val seedSnap = seedDoc.get().await()
+            val alreadySeeded = seedSnap.getBoolean("done") == true
+
+            if (!alreadySeeded) {
+                val batch = db.batch()
+                samplePlaces().forEach { p -> batch.set(placesCol.document(p.id), p) }
+                batch.set(seedDoc, mapOf("done" to true))
+                batch.commit().await()
             }
-            .map { p -> if (p.id in favorites) p.copy(isFavorite = true) else p.copy(isFavorite = false) }
+
+            startPlacesListener(
+                placesColRef = placesCol,
+                onData = {
+                    places = it
+                    loading = false
+                },
+                onError = {
+                    error = it
+                    loading = false
+                }
+            )
+        } catch (e: Exception) {
+            error = e.message ?: "Something went wrong"
+            loading = false
+        }
+    }
+
+    val filtered = remember(query, selectedCategory, places) {
+        places.filter { p ->
+            (selectedCategory == null || p.category == selectedCategory) &&
+                    (query.isBlank() || p.name.contains(query, ignoreCase = true))
+        }
     }
 
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("TripWise", fontWeight = FontWeight.Bold) },
-                navigationIcon = {
-                    IconButton(onClick = { /* open drawer if added */ }) {
-                        Icon(Icons.Default.Menu, contentDescription = "Menu")
-                    }
-                },
                 actions = {
-                    IconButton(onClick = { /* profile */ }) {
-                        Icon(Icons.Default.Person, contentDescription = "Profile")
+                    IconButton(onClick = onLogout) {
+                        Icon(Icons.Default.Logout, contentDescription = "Logout")
                     }
                 }
             )
+        },
+        floatingActionButton = {
+            FloatingActionButton(onClick = { showAddDialog = true }) {
+                Icon(Icons.Default.Add, contentDescription = "Add Place")
+            }
         }
     ) { inner ->
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(inner)
         ) {
-            // Gradient header
+            // Header
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -134,19 +186,21 @@ fun HomeScreen() {
             ) {
                 Column {
                     Text(
-                        "Find nearby gems",
+                        "Discover nearby places",
                         fontSize = 22.sp,
                         fontWeight = FontWeight.SemiBold
                     )
+
                     Spacer(Modifier.height(8.dp))
+
                     SearchBar(
                         value = query,
                         onValueChange = { query = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = "Search attractions, restaurants, hotels…",
-                        onSearch = { /* optional: trigger search */ }
+                        modifier = Modifier.fillMaxWidth()
                     )
+
                     Spacer(Modifier.height(12.dp))
+
                     CategoryChips(
                         selected = selectedCategory,
                         onSelect = { selectedCategory = if (selectedCategory == it) null else it }
@@ -154,13 +208,19 @@ fun HomeScreen() {
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(10.dp))
 
-            MapCTACard(
-                onOpenMap = { /* navigate to Map screen */ }
-            )
+            if (loading) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+                return@Scaffold
+            }
 
-            Spacer(Modifier.height(8.dp))
+            error?.let {
+                Text("Error: $it", color = Color.Red, modifier = Modifier.padding(16.dp))
+                return@Scaffold
+            }
 
             Text(
                 "Nearby",
@@ -169,49 +229,93 @@ fun HomeScreen() {
             )
 
             androidx.compose.foundation.lazy.LazyColumn(
-                contentPadding = PaddingValues(bottom = 24.dp)
+                contentPadding = PaddingValues(bottom = 90.dp)
             ) {
                 items(filtered.size) { idx ->
                     val place = filtered[idx]
                     PlaceCard(
                         place = place,
                         onToggleFavorite = {
-                            scope.launch {
-                                favorites = if (place.id in favorites)
-                                    favorites - place.id
-                                else favorites + place.id
-                            }
+                            placesCol.document(place.id).update("isFavorite", !place.isFavorite)
                         },
-                        onDetails = { /* navigate to detail */ }
+                        onDetails = {
+                            onOpenDetails(userId, place.id)
+                        }
                     )
                 }
-                item { Spacer(Modifier.height(8.dp)) }
             }
+        }
+
+        if (showAddDialog) {
+            AddPlaceDialog(
+                onDismiss = { showAddDialog = false },
+                onAdd = { name, category, address, rating ->
+                    showAddDialog = false
+                    addPlaceToFirestore(placesCol, name, category, address, rating)
+                }
+            )
         }
     }
 }
+
+/* ---------- Firestore helpers ---------- */
+
+private fun startPlacesListener(
+    placesColRef: com.google.firebase.firestore.CollectionReference,
+    onData: (List<Place>) -> Unit,
+    onError: (String) -> Unit
+): ListenerRegistration {
+    return placesColRef
+        .orderBy("name")
+        .addSnapshotListener { snap, e ->
+            if (e != null) {
+                onError(e.message ?: "Failed to load places")
+                return@addSnapshotListener
+            }
+            val list = snap?.documents?.mapNotNull { it.toObject(Place::class.java) } ?: emptyList()
+            onData(list)
+        }
+}
+
+private fun addPlaceToFirestore(
+    placesCol: com.google.firebase.firestore.CollectionReference,
+    name: String,
+    category: String,
+    address: String,
+    rating: Double
+) {
+    val docRef: DocumentReference = placesCol.document()
+    val randomDistance = (300..2500).random()
+
+    val place = Place(
+        id = docRef.id,
+        name = name.trim(),
+        category = category,
+        distanceMeters = randomDistance,
+        rating = rating,
+        address = address.trim(),
+        isFavorite = false
+    )
+
+    docRef.set(place)
+}
+
+/* ---------- UI Components ---------- */
 
 @Composable
 private fun SearchBar(
     value: String,
     onValueChange: (String) -> Unit,
-    modifier: Modifier = Modifier,
-    placeholder: String = "Search…",
-    onSearch: () -> Unit = {}
+    modifier: Modifier = Modifier
 ) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
         singleLine = true,
         leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-        trailingIcon = {
-            IconButton(onClick = onSearch) {
-                Icon(Icons.Default.FilterList, contentDescription = "Filter")
-            }
-        },
-        placeholder = { Text(placeholder) },
+        placeholder = { Text("Search places…") },
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-        keyboardActions = KeyboardActions(onSearch = { onSearch() }),
+        keyboardActions = KeyboardActions(onSearch = {}),
         shape = RoundedCornerShape(14.dp),
         modifier = modifier
     )
@@ -219,10 +323,11 @@ private fun SearchBar(
 
 @Composable
 private fun CategoryChips(
-    selected: Category?,
-    onSelect: (Category) -> Unit
+    selected: String?,
+    onSelect: (String) -> Unit
 ) {
-    val categories = listOf(Category.Attractions, Category.Restaurants, Category.Hotels)
+    val categories = listOf("Attractions", "Restaurants", "Hotels")
+
     Row(
         modifier = Modifier
             .horizontalScroll(rememberScrollState())
@@ -231,14 +336,15 @@ private fun CategoryChips(
         Spacer(Modifier.width(12.dp))
         categories.forEach { cat ->
             val isSelected = selected == cat
+
             AssistChip(
                 onClick = { onSelect(cat) },
-                label = { Text(cat.name) },
+                label = { Text(cat) },
                 leadingIcon = {
                     when (cat) {
-                        Category.Attractions -> Icon(Icons.Default.Place, contentDescription = null)
-                        Category.Restaurants -> Icon(Icons.Default.Star, contentDescription = null)
-                        Category.Hotels -> Icon(Icons.Default.LocationOn, contentDescription = null)
+                        "Attractions" -> Icon(Icons.Default.Place, contentDescription = null)
+                        "Restaurants" -> Icon(Icons.Default.Restaurant, contentDescription = null)
+                        else -> Icon(Icons.Default.Hotel, contentDescription = null)
                     }
                 },
                 modifier = Modifier.padding(horizontal = 6.dp),
@@ -246,55 +352,11 @@ private fun CategoryChips(
                     containerColor = if (isSelected)
                         MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
                     else
-                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
-                    labelColor = if (isSelected)
-                        MaterialTheme.colorScheme.primary
-                    else
-                        MaterialTheme.colorScheme.onSurfaceVariant
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
                 )
             )
         }
         Spacer(Modifier.width(12.dp))
-    }
-}
-
-@Composable
-private fun MapCTACard(onOpenMap: () -> Unit) {
-    ElevatedCard(
-        modifier = Modifier
-            .padding(horizontal = 16.dp, vertical = 6.dp)
-            .fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(46.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(Icons.Default.Map, contentDescription = null)
-            }
-            Spacer(Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text("View on Map", fontWeight = FontWeight.SemiBold)
-                Text(
-                    "See all nearby spots and directions",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            Button(onClick = onOpenMap, shape = RoundedCornerShape(12.dp)) {
-                Text("Open")
-            }
-        }
     }
 }
 
@@ -312,29 +374,21 @@ private fun PlaceCard(
         shape = RoundedCornerShape(16.dp)
     ) {
         Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            // Leading icon/avatar placeholder
+
             Box(
                 modifier = Modifier
                     .size(52.dp)
                     .clip(RoundedCornerShape(12.dp))
-                    .background(
-                        Brush.linearGradient(
-                            listOf(
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
-                                MaterialTheme.colorScheme.secondary.copy(alpha = 0.18f)
-                            )
-                        )
-                    ),
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = when (place.category) {
-                        Category.Attractions -> Icons.Default.Place
-                        Category.Restaurants -> Icons.Default.Star
-                        Category.Hotels -> Icons.Default.LocationOn
+                        "Attractions" -> Icons.Default.Place
+                        "Restaurants" -> Icons.Default.Restaurant
+                        else -> Icons.Default.Hotel
                     },
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary
+                    contentDescription = null
                 )
             }
 
@@ -347,22 +401,15 @@ private fun PlaceCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+
                 Spacer(Modifier.height(2.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Default.Star,
-                        contentDescription = null,
-                        tint = Color(0xFFFFC107),
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        "${place.rating} • ${(place.distanceMeters / 1000.0).let { "%.1f".format(it) }} km away",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Spacer(Modifier.height(2.dp))
+
+                Text(
+                    "${place.rating} ★  •  ${(place.distanceMeters / 1000.0).let { "%.1f".format(it) }} km",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
                 Text(
                     place.address,
                     style = MaterialTheme.typography.bodySmall,
@@ -374,7 +421,7 @@ private fun PlaceCard(
 
             IconButton(onClick = onToggleFavorite) {
                 if (place.isFavorite) {
-                    Icon(Icons.Default.Favorite, contentDescription = "Unfavorite", tint = MaterialTheme.colorScheme.primary)
+                    Icon(Icons.Default.Favorite, contentDescription = "Unfavorite")
                 } else {
                     Icon(Icons.Default.FavoriteBorder, contentDescription = "Favorite")
                 }
@@ -383,10 +430,104 @@ private fun PlaceCard(
     }
 }
 
-/* ---------- Preview ---------- */
+/* ---------- Add Place Dialog ---------- */
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddPlaceDialog(
+    onDismiss: () -> Unit,
+    onAdd: (name: String, category: String, address: String, rating: Double) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var address by remember { mutableStateOf("") }
+    var ratingText by remember { mutableStateOf("4.5") }
+
+    var category by remember { mutableStateOf("Attractions") }
+    var expanded by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add a Place") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Place name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(10.dp))
+
+                ExposedDropdownMenuBox(
+                    expanded = expanded,
+                    onExpandedChange = { expanded = !expanded }
+                ) {
+                    OutlinedTextField(
+                        value = category,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Category") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                        modifier = Modifier
+                            .menuAnchor()
+                            .fillMaxWidth()
+                    )
+                    ExposedDropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false }
+                    ) {
+                        listOf("Attractions", "Restaurants", "Hotels").forEach {
+                            DropdownMenuItem(
+                                text = { Text(it) },
+                                onClick = {
+                                    category = it
+                                    expanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                OutlinedTextField(
+                    value = address,
+                    onValueChange = { address = it },
+                    label = { Text("Address") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(10.dp))
+
+                OutlinedTextField(
+                    value = ratingText,
+                    onValueChange = { ratingText = it },
+                    label = { Text("Rating (0.0 - 5.0)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val r = ratingText.toDoubleOrNull()?.coerceIn(0.0, 5.0) ?: 4.5
+                    if (name.trim().isNotEmpty() && address.trim().isNotEmpty()) {
+                        onAdd(name, category, address, ((r * 10).roundToInt() / 10.0))
+                    }
+                }
+            ) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
 
 @Preview(showBackground = true)
 @Composable
 private fun HomePreview() {
-    TripWiseTheme { HomeScreen() }
+    TripWiseTheme { HomeScreen(onLogout = {}, onOpenDetails = { _, _ -> }) }
 }
